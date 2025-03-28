@@ -7,10 +7,34 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import readline from "readline/promises";
 import dotenv from "dotenv";
+import axios from "axios";
+
+interface ChatResponse {
+  data: {
+    choices: {
+      index: string,
+      message: {
+        content: string
+        role: string
+        tool_calls?:
+        {
+          index: 0,
+          id: string,
+          type: 'function',
+          function: any
+        }[]
+      },
+      logprobs: any
+      finish_reason: string
+    }[];
+  };
+}
+
 
 dotenv.config();
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL;
 if (!ANTHROPIC_API_KEY) {
   throw new Error("ANTHROPIC_API_KEY is not set");
 }
@@ -19,12 +43,19 @@ class MCPClient {
   private mcp: Client;
   private anthropic: Anthropic;
   private transport: StdioClientTransport | null = null;
-  private tools: Tool[] = [];
-
+  private tools: any[] = [];
+  private client: Axios.AxiosInstance;
   constructor() {
     this.anthropic = new Anthropic({
       apiKey: ANTHROPIC_API_KEY,
     });
+    this.client = axios.create({
+      baseURL: ANTHROPIC_BASE_URL,
+      headers: {
+        Authorization: `Bearer ${ANTHROPIC_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    }) as Axios.AxiosInstance;
     this.mcp = new Client({ name: "mcp-client-cli", version: "1.0.0" });
   }
   // methods will go here
@@ -40,19 +71,22 @@ class MCPClient {
           ? "python"
           : "python3"
         : process.execPath;
-      
+
       this.transport = new StdioClientTransport({
         command,
         args: [serverScriptPath],
       });
       this.mcp.connect(this.transport);
-      
+
       const toolsResult = await this.mcp.listTools();
       this.tools = toolsResult.tools.map((tool) => {
         return {
-          name: tool.name,
-          description: tool.description,
-          input_schema: tool.inputSchema,
+          type: "function",
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.inputSchema,
+          }
         };
       });
       console.log(
@@ -72,24 +106,27 @@ class MCPClient {
         content: query,
       },
     ];
-    const response = await this.anthropic.messages.create({
+
+    console.dir(JSON.stringify(this.tools), { depth: null });
+    // What is the weather today in GuangZhou?
+    const response: ChatResponse = await this.client.post("/chat/completions", {
       model: "deepseek-chat",
-      max_tokens: 1000,
       messages,
+      stream: false,
       tools: this.tools,
-    });
-  
-    console.log("Response from Anthropic:", response);
+    })
+
     const finalText = [];
     const toolResults = [];
-  
-    for (const content of response.content) {
-      if (content.type === "text") {
-        finalText.push(content.text);
-      } else if (content.type === "tool_use") {
-        const toolName = content.name;
-        const toolArgs = content.input as { [x: string]: unknown } | undefined;
-  
+    const content = response.data?.choices[0].message;
+    if (content.content) {
+      finalText.push(content.content);
+    } else if (content.tool_calls) {
+      for(const tool of content.tool_calls){
+        const func = tool.function;
+        const toolName = func.name;
+        const toolArgs = JSON.parse(func.arguments) as { [x: string]: unknown } | undefined;
+
         const result = await this.mcp.callTool({
           name: toolName,
           arguments: toolArgs,
@@ -98,24 +135,23 @@ class MCPClient {
         finalText.push(
           `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`
         );
-  
+
         messages.push({
           role: "user",
           content: result.content as string,
         });
-  
-        const response = await this.anthropic.messages.create({
+
+        const response: ChatResponse = await this.client.post("/chat/completions", {
           model: "deepseek-chat",
-          max_tokens: 1000,
           messages,
-        });
-  
+          stream: false,
+        })
+
         finalText.push(
-          response.content[0].type === "text" ? response.content[0].text : ""
+          response.data.choices[0].message.content as string
         );
       }
     }
-  
     return finalText.join("\n");
   }
 
@@ -124,11 +160,11 @@ class MCPClient {
       input: process.stdin,
       output: process.stdout,
     });
-  
+
     try {
       console.log("\nMCP Client Started!");
       console.log("Type your queries or 'quit' to exit.");
-  
+
       while (true) {
         const message = await rl.question("\nQuery: ");
         if (message.toLowerCase() === "quit") {
@@ -137,11 +173,13 @@ class MCPClient {
         const response = await this.processQuery(message);
         console.log("\n" + response);
       }
+    } catch (e) {
+      console.log("Error in chatLoop: ", e);
     } finally {
       rl.close();
     }
   }
-  
+
   async cleanup() {
     await this.mcp.close();
   }
